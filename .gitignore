@@ -1,0 +1,11 @@
+.env
+inventory.db
+food_db.sqlite3
+フードロスのkey.txt
+楽天API.txt
+グループサーバー編集.txt
+desktop.ini
+__pycache__/
+*.pyc
+.venv/
+venv/

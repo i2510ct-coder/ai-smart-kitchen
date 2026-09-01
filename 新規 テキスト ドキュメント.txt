@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>フードロス綱引き</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .rope-track { height: 40px; background: #e2e8f0; border-radius: 999px; overflow: hidden; position: relative; border: 4px solid #cbd5e1; }
+        .rope { height: 100%; background: #8b4513; width: 20px; position: absolute; left: 50%; transition: left 0.5s ease; }
+    </style>
+</head>
+<body class="bg-slate-50 min-h-screen p-4 flex flex-col items-center">
+
+    <div class="max-w-md w-full bg-white p-6 rounded-3xl shadow-xl">
+        <h1 class="text-xl font-bold text-slate-800 mb-1">⚖️ フードロス綱引き</h1>
+        <p id="status-msg" class="text-sm text-slate-600 mb-4">1日ずつ進めて冷蔵庫を管理しよう！</p>
+        
+        <div class="mb-4 text-sm text-slate-600">
+            現在のロスのリスク額: <span id="loss-amount" class="font-bold text-slate-800">0</span> 円
+        </div>
+
+        <!-- 綱引きバー -->
+        <div class="rope-track mb-6">
+            <div id="rope" class="rope"></div>
+            <div class="absolute left-2 top-2 text-xs font-bold text-red-600">ゴミ箱行き</div>
+            <div class="absolute right-2 top-2 text-xs font-bold text-green-700">食べた！</div>
+        </div>
+
+        <div id="inventory-list" class="space-y-3">
+            <!-- 食材リスト -->
+        </div>
+
+        <button onclick="nextDay()" class="mt-6 w-full bg-blue-600 text-white font-bold py-3 rounded-2xl hover:bg-blue-700 transition">
+            1日進める
+        </button>
+    </div>
+
+    <script>
+        let inventory = [
+            { name: "ブロッコリー", expiry: 0, price: 150 },
+            { name: "牛乳", expiry: 1, price: 300 },
+            { name: "みかん", expiry: 5, price: 500 }
+        ];
+
+        let ropePos = 50; 
+        const rope = document.getElementById('rope');
+        const statusMsg = document.getElementById('status-msg');
+        const lossAmountEl = document.getElementById('loss-amount');
+        const listEl = document.getElementById('inventory-list');
+
+        function nextDay() {
+            if (inventory.length === 0) return;
+
+            // 1日経過：賞味期限を減らす
+            inventory.forEach(item => item.expiry -= 1);
+
+            // 引力を計算（期限が0以下ならゴミ箱へ強く引かれる）
+            let drift = 0;
+            inventory.forEach(item => {
+                if (item.expiry < 0) drift += 15; // 期限切れは即ゴミ箱へ
+                else if (item.expiry === 0) drift += 10;
+                else drift += 2;
+            });
+
+            ropePos -= drift;
+            
+            if (ropePos <= 0) {
+                ropePos = 0;
+                const totalLoss = inventory.reduce((sum, item) => sum + item.price, 0);
+                lossAmountEl.innerText = totalLoss;
+                statusMsg.innerHTML = `<span class="text-red-600 font-bold">残念！${totalLoss}円分がゴミ箱行きになりました</span>`;
+                inventory = [];
+            }
+            
+            renderList();
+            rope.style.left = `calc(${ropePos}% - 10px)`;
+        }
+
+        function renderList() {
+            listEl.innerHTML = '';
+            inventory.forEach((item, index) => {
+                const div = document.createElement('div');
+                div.className = "flex justify-between items-center bg-slate-100 p-3 rounded-xl";
+                div.innerHTML = `
+                    <div>
+                        <div class="font-bold">${item.name} (${item.price}円)</div>
+                        <div class="text-xs ${item.expiry <= 0 ? 'text-red-600 font-bold' : 'text-slate-500'}">
+                            期限: ${item.expiry <= 0 ? '本日まで' : item.expiry + '日'}
+                        </div>
+                    </div>
+                    <button onclick="eat(${index})" class="bg-green-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-green-700">食べた！</button>
+                `;
+                listEl.appendChild(div);
+            });
+        }
+
+        function eat(index) {
+            inventory.splice(index, 1);
+            ropePos += 15; 
+            if (ropePos > 100) ropePos = 100;
+            renderList();
+            rope.style.left = `calc(${ropePos}% - 10px)`;
+        }
+
+        renderList();
+    </script>
+</body>
+</html>
