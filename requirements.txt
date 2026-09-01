@@ -1,0 +1,10 @@
+streamlit
+opencv-python-headless
+numpy
+pyzbar
+google-genai
+pydantic
+python-dotenv
+pandas
+plotly
+requests
