@@ -1,36 +1,59 @@
+import calendar
 import datetime
-import cv2
-import numpy as np
+import html
 import json
 import os
 import sqlite3
-import time
+
+import cv2
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import requests
 import streamlit as st
+import streamlit.components.v1 as components
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
 
 load_dotenv()
 
-# ===== pyzbar は zbar 共有ライブラリが無いと import 自体に失敗することがあるので、
-#       try/except で捕まえて分かりやすいメッセージを出せるようにする =====
+# ===== pyzbar は zbar 共有ライブラリが無いと import に失敗することがある =====
 try:
     from pyzbar import pyzbar
+
     PYZBAR_AVAILABLE = True
     PYZBAR_IMPORT_ERROR = None
 except Exception as e:
     PYZBAR_AVAILABLE = False
     PYZBAR_IMPORT_ERROR = str(e)
 
+
+# ===== シークレット読み込み（Streamlit Cloud の Secrets → 環境変数/.env の順） =====
+def get_secret(key: str):
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key)
+
+
 # ===== 設定 =====
 DB_PATH = "inventory.db"
 MODEL_TEXT = "gemini-2.5-flash"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-RAKUTEN_APP_ID = os.getenv("RAKUTEN_APP_ID")
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+RAKUTEN_APP_ID = get_secret("RAKUTEN_APP_ID")
+APP_PASSWORD = get_secret("APP_PASSWORD")  # 設定されていればパスワード入力を要求
+
+FOOD_TYPES = ["一般食品", "防災食", "調味料"]
+STATUS_STOCK = "在庫"
+STATUS_CONSUMED = "消費済み"
+STATUS_DISCARDED = "廃棄"
 
 
-# ===== Gemini 構造化出力用のスキーマ定義 =====
+# ===== Gemini 構造化出力用のスキーマ =====
 class InventoryItemSchema(BaseModel):
     name: str = Field(description="食材名（日本語）")
     price: int = Field(description="数値（不明なら 0）")
@@ -42,9 +65,13 @@ class InventoryItemSchema(BaseModel):
     )
 
 
-# ===== DB 初期化 =====
+# ===== DB =====
+def get_conn():
+    return sqlite3.connect(DB_PATH)
+
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     c = conn.cursor()
     c.execute(
         """
@@ -54,81 +81,150 @@ def init_db():
             name TEXT NOT NULL,
             expiry_date TEXT NOT NULL,
             price REAL NOT NULL,
-            status TEXT NOT NULL
+            status TEXT NOT NULL,
+            closed_at TEXT NOT NULL DEFAULT ''
         )
         """
+    )
+    # 既存DBに closed_at 列が無ければ追加（消費・廃棄した日時）
+    c.execute("PRAGMA table_info(inventory)")
+    cols = [r[1] for r in c.fetchall()]
+    if "closed_at" not in cols:
+        c.execute("ALTER TABLE inventory ADD COLUMN closed_at TEXT NOT NULL DEFAULT ''")
+    conn.commit()
+    conn.close()
+
+
+def insert_item(food_type, name, expiry_date, price, status=STATUS_STOCK, closed_at=""):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO inventory (food_type, name, expiry_date, price, status, closed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (food_type, name, expiry_date, price, status, closed_at),
     )
     conn.commit()
     conn.close()
 
 
-def get_conn():
-    return sqlite3.connect(DB_PATH)
+def update_status(item_id, new_status):
+    closed_at = (
+        datetime.datetime.now().isoformat(timespec="seconds")
+        if new_status != STATUS_STOCK
+        else ""
+    )
+    conn = get_conn()
+    conn.execute(
+        "UPDATE inventory SET status = ?, closed_at = ? WHERE id = ?",
+        (new_status, closed_at, item_id),
+    )
+    conn.commit()
+    conn.close()
 
 
-# ===== 共通ロジック =====
-def calc_days_left(expiry_date_str: str) -> int:
-    today = datetime.date.today()
+def update_item(item_id, name, food_type, expiry_date, price):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE inventory SET name = ?, food_type = ?, expiry_date = ?, price = ? WHERE id = ?",
+        (name, food_type, expiry_date, price, item_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_all_items():
+    conn = get_conn()
+    conn.execute("DELETE FROM inventory")
+    conn.commit()
+    conn.close()
+
+
+def fetch_items(status_filter=None, food_type_filter=None):
+    conn = get_conn()
+    c = conn.cursor()
+    query = (
+        "SELECT id, food_type, name, expiry_date, price, status, closed_at "
+        "FROM inventory WHERE 1=1"
+    )
+    params = []
+    if status_filter:
+        query += " AND status = ?"
+        params.append(status_filter)
+    if food_type_filter:
+        query += " AND food_type = ?"
+        params.append(food_type_filter)
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+    keys = ["id", "food_type", "name", "expiry_date", "price", "status", "closed_at"]
+    return [dict(zip(keys, r)) for r in rows]
+
+
+# ===== 日付・判定ロジック =====
+def parse_expiry(expiry_date_str: str):
+    """'YYYY-MM-DD' または 'YYYY-MM' を date に変換。失敗したら None。
+    'YYYY-MM' はその月の末日として扱う。"""
+    s = (expiry_date_str or "").strip()
     try:
-        if len(expiry_date_str) == 7:  # YYYY-MM形式
-            expiry = datetime.datetime.strptime(expiry_date_str + "-01", "%Y-%m-%d").date()
-            import calendar
-            last_day = calendar.monthrange(expiry.year, expiry.month)[1]
-            expiry = expiry.replace(day=last_day)
-        else:
-            expiry = datetime.datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
-        return (expiry - today).days
-    except Exception:
-        return 0
+        if len(s) == 7:
+            d = datetime.datetime.strptime(s + "-01", "%Y-%m-%d").date()
+            last_day = calendar.monthrange(d.year, d.month)[1]
+            return d.replace(day=last_day)
+        return datetime.datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
-def judge_threshold(food_type: str, days_left: int) -> str:
-    if food_type == "一般食品":
-        if days_left < 0:
-            return "赤"
-        elif days_left <= 2:
-            return "黄"
-        else:
-            return "緑"
-    elif food_type in ["防災食", "調味料"]:
-        if days_left < 0:
-            return "赤"
-        elif days_left <= 30:
-            return "黄"
-        else:
-            return "緑"
-    else:
-        if days_left < 0:
-            return "赤"
-        elif days_left <= 2:
-            return "黄"
-        else:
-            return "緑"
+def calc_days_left(expiry_date_str: str):
+    """残り日数。日付が壊れている場合は None（0日と誤判定しない）。"""
+    expiry = parse_expiry(expiry_date_str)
+    if expiry is None:
+        return None
+    return (expiry - datetime.date.today()).days
 
 
-def is_near_expiry(food_type: str, days_left: int) -> bool:
+def judge_threshold(food_type: str, days_left) -> str:
+    if days_left is None:
+        return "不明"
+    limit = 30 if food_type in ("防災食", "調味料") else 2
+    if days_left < 0:
+        return "赤"
+    elif days_left <= limit:
+        return "黄"
+    return "緑"
+
+
+def is_near_expiry(food_type: str, days_left) -> bool:
+    if days_left is None:
+        return False
     if food_type == "一般食品":
         return days_left <= 2
-    elif food_type in ["防災食", "調味料"]:
+    if food_type in ("防災食", "調味料"):
         return days_left <= 30
     return False
 
 
-# ===== Gemini クライアント =====
+def level_css_class(level: str) -> str:
+    return {"赤": "danger", "黄": "warning", "緑": "safe"}.get(level, "unknown")
+
+
+def days_label(days_left) -> str:
+    return "期限不明" if days_left is None else f"{days_left} 日"
+
+
+def sort_key_days(item) -> int:
+    d = calc_days_left(item["expiry_date"])
+    return 10**9 if d is None else d
+
+
+# ===== Gemini =====
 def get_gemini_client():
     if not GEMINI_API_KEY:
-        st.error("GEMINI_API_KEY が設定されていません。.env ファイルを確認してください。")
+        st.error("GEMINI_API_KEY が設定されていません。Secrets（または .env）を確認してください。")
         return None
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
 def analyze_image_with_gemini(image_bytes: bytes, mime_type: str = "image/jpeg"):
-    """
-    画像を解析して食材情報を抽出する。
-    mime_type は呼び出し側で実際のファイル形式に合わせて渡すこと。
-    st.camera_input() は JPEG を返すので "image/jpeg" のままでOK。
-    st.file_uploader() は PNG の場合があるので up.type を渡す必要がある。
-    """
     client = get_gemini_client()
     if client is None:
         return None
@@ -137,14 +233,11 @@ def analyze_image_with_gemini(image_bytes: bytes, mime_type: str = "image/jpeg")
 画像に写っているパッケージや賞味期限の表示から、食材名・価格・区分・賞味期限を読み取ってください。
 「5月20日」などの表現は、今年（現在{datetime.date.today().year}年）または来年の日付として YYYY-MM-DD に変換してください。
 """
-
-    # mime_type が想定外の値だった場合の保険（例: "image/jpg" のような表記ゆれ対策）
     valid_mime_types = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
     if mime_type not in valid_mime_types:
         mime_type = "image/jpeg"
 
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-
     try:
         res = client.models.generate_content(
             model=MODEL_TEXT,
@@ -154,105 +247,12 @@ def analyze_image_with_gemini(image_bytes: bytes, mime_type: str = "image/jpeg")
                 response_schema=InventoryItemSchema,
             ),
         )
-        data = json.loads(res.text)
-        return data
+        return json.loads(res.text)
     except Exception as e:
         st.error(f"画像解析に失敗しました。手動で入力してください。エラー: {e}")
         return None
 
 
-def read_barcode_from_image(image_bytes: bytes):
-    """
-    バーコードを画像から読み取る。
-    zbar 共有ライブラリが無い環境ではここで分かりやすいエラーを出す。
-    通常のデコードで失敗した場合、グレースケール化・拡大した画像でも
-    もう一度試すことで検出率を上げる。
-    """
-    if not PYZBAR_AVAILABLE:
-        st.error(
-            "バーコード読み取り機能が使えません（zbar ライブラリが見つかりません）。\n\n"
-            "Windows: pip install pyzbar で通常は同梱されますが、失敗する場合は "
-            "Visual C++ 再頒布可能パッケージが必要です。\n"
-            "Mac: `brew install zbar` を実行してください。\n"
-            "Linux: `sudo apt-get install libzbar0` を実行してください。\n\n"
-            f"詳細エラー: {PYZBAR_IMPORT_ERROR}"
-        )
-        return None
-
-    img_array = np.frombuffer(image_bytes, dtype=np.uint8)
-    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-    if img is None:
-        st.warning("画像の読み込みに失敗しました。もう一度撮影してください。")
-        return None
-
-    # 1回目：そのままの画像でデコード
-    barcodes = pyzbar.decode(img)
-
-    # 2回目：グレースケール化＋拡大して再挑戦（ピント甘め・小さいバーコード対策）
-    if not barcodes:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray_large = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-        barcodes = pyzbar.decode(gray_large)
-
-    # 3回目：二値化して再挑戦
-    if not barcodes:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        barcodes = pyzbar.decode(thresh)
-
-    if barcodes:
-        return barcodes[0].data.decode("utf-8")
-    return None
-
-
-def get_product_name_from_barcode(barcode: str):
-    """
-    バーコード(JANコード)から商品名を推測する。
-    楽天市場のキーワード検索APIはJANコード検索に強くないため、
-    まず Open Food Facts (食品専用・無料・APIキー不要・JANコード直接検索対応) を試し、
-    ヒットしなければ楽天にフォールバックする。
-    """
-    import requests
-
-    # --- 1. Open Food Facts（JANコード直接検索。食品バーコードに強い） ---
-    try:
-        url = f"https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
-        res = requests.get(url, timeout=5, headers={"User-Agent": "AI-SmartKitchen/1.0"})
-        data = res.json()
-        if data.get("status") == 1:
-            product = data.get("product", {})
-            name = (
-                product.get("product_name_ja")
-                or product.get("product_name")
-                or product.get("generic_name")
-            )
-            if name:
-                return name
-    except Exception:
-        pass
-
-    # --- 2. 楽天市場キーワード検索（フォールバック） ---
-    if not RAKUTEN_APP_ID:
-        return None
-    url = "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20170901"
-    params = {
-        "applicationId": RAKUTEN_APP_ID,
-        "keyword": barcode,
-        "hits": 1,
-        "format": "json",
-    }
-    try:
-        res = requests.get(url, params=params, timeout=5)
-        data = res.json()
-        items = data.get("Items", [])
-        if items:
-            return items[0]["Item"]["itemName"]
-    except Exception:
-        pass
-    return None
-
-
-# 音声から「卵 200円 一般食品 2026-05-20」などを抽出
 def analyze_audio_with_gemini(audio_bytes: bytes, mime_type: str = "audio/wav"):
     client = get_gemini_client()
     if client is None:
@@ -262,9 +262,7 @@ def analyze_audio_with_gemini(audio_bytes: bytes, mime_type: str = "audio/wav"):
 音声の内容（日本語）から、発話されている食材名、価格、区分、賞味期限を特定してください。
 「5月20日」などの表現は、今年（現在{datetime.date.today().year}年）または来年の日付として YYYY-MM-DD に変換してください。
 """
-
     audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
-
     try:
         res = client.models.generate_content(
             model=MODEL_TEXT,
@@ -274,26 +272,22 @@ def analyze_audio_with_gemini(audio_bytes: bytes, mime_type: str = "audio/wav"):
                 response_schema=InventoryItemSchema,
             ),
         )
-        data = json.loads(res.text)
-        return data
+        return json.loads(res.text)
     except Exception as e:
         st.error(f"音声解析に失敗しました。手動で入力してください。エラー: {e}")
         return None
 
 
-# レシピ提案
 def generate_recipe_with_gemini(selected_items):
+    """レシピ生成。失敗してもアプリが落ちないよう、エラー文を返す。"""
     client = get_gemini_client()
     if client is None:
-        return "Gemini API キーが設定されていません。"
+        return None
 
-    context_lines = []
-    for item in selected_items:
-        context_lines.append(
-            f"- 食材名: {item['name']} / 区分: {item['food_type']} / 期限: {item['expiry_date']}"
-        )
-    context = "\n".join(context_lines)
-
+    context = "\n".join(
+        f"- 食材名: {i['name']} / 区分: {i['food_type']} / 期限: {i['expiry_date']}"
+        for i in selected_items
+    )
     prompt = f"""
 あなたは家庭の冷蔵庫管理を支援するプロの料理家です。
 以下の食材を「できるだけ無駄なく」使うレシピを日本語で提案してください。
@@ -311,83 +305,159 @@ def generate_recipe_with_gemini(selected_items):
   - 美味しく作るコツ
 を箇条書きでわかりやすく説明してください。
 """
-
-    res = client.models.generate_content(model=MODEL_TEXT, contents=prompt)
-    return res.text
-
-
-# ===== DB 操作 =====
-def insert_item(food_type, name, expiry_date, price, status="在庫"):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO inventory (food_type, name, expiry_date, price, status) VALUES (?, ?, ?, ?, ?)",
-        (food_type, name, expiry_date, price, status),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        res = client.models.generate_content(model=MODEL_TEXT, contents=prompt)
+        if not res.text:
+            st.error("レシピを生成できませんでした。もう一度お試しください。")
+            return None
+        return res.text
+    except Exception as e:
+        st.error(f"レシピ生成に失敗しました。時間をおいて再度お試しください。エラー: {e}")
+        return None
 
 
-def update_status(item_id, new_status):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE inventory SET status = ? WHERE id = ?", (new_status, item_id)
-    )
-    conn.commit()
-    conn.close()
-
-
-def update_item(item_id, name, food_type, expiry_date, price):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "UPDATE inventory SET name = ?, food_type = ?, expiry_date = ?, price = ? WHERE id = ?",
-        (name, food_type, expiry_date, price, item_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def fetch_items(status_filter=None, food_type_filter=None):
-    conn = get_conn()
-    c = conn.cursor()
-    query = "SELECT id, food_type, name, expiry_date, price, status FROM inventory WHERE 1=1"
-    params = []
-    if status_filter:
-        query += " AND status = ?"
-        params.append(status_filter)
-    if food_type_filter:
-        query += " AND food_type = ?"
-        params.append(food_type_filter)
-    c.execute(query, params)
-    rows = c.fetchall()
-    conn.close()
-
-    items = []
-    for r in rows:
-        items.append(
-            {
-                "id": r[0],
-                "food_type": r[1],
-                "name": r[2],
-                "expiry_date": r[3],
-                "price": r[4],
-                "status": r[5],
-            }
+# ===== バーコード =====
+def read_barcode_from_image(image_bytes: bytes):
+    if not PYZBAR_AVAILABLE:
+        st.error(
+            "バーコード読み取り機能が使えません（zbar ライブラリが見つかりません）。\n\n"
+            "Streamlit Cloud: リポジトリに packages.txt を置き `libzbar0` と書いてください。\n"
+            "Mac: `brew install zbar` / Linux: `sudo apt-get install libzbar0`\n\n"
+            f"詳細エラー: {PYZBAR_IMPORT_ERROR}"
         )
-    return items
+        return None
+
+    img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if img is None:
+        st.warning("画像の読み込みに失敗しました。もう一度撮影してください。")
+        return None
+
+    barcodes = pyzbar.decode(img)
+
+    if not barcodes:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray_large = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+        barcodes = pyzbar.decode(gray_large)
+
+    if not barcodes:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        barcodes = pyzbar.decode(thresh)
+
+    if barcodes:
+        return barcodes[0].data.decode("utf-8")
+    return None
+
+
+def get_product_name_from_barcode(barcode: str):
+    # 1. Open Food Facts
+    try:
+        url = f"https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
+        res = requests.get(url, timeout=5, headers={"User-Agent": "AI-SmartKitchen/1.0"})
+        data = res.json()
+        if data.get("status") == 1:
+            product = data.get("product", {})
+            name = (
+                product.get("product_name_ja")
+                or product.get("product_name")
+                or product.get("generic_name")
+            )
+            if name:
+                return name
+    except Exception:
+        pass
+
+    # 2. 楽天市場（フォールバック）
+    if not RAKUTEN_APP_ID:
+        return None
+    try:
+        res = requests.get(
+            "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20170901",
+            params={
+                "applicationId": RAKUTEN_APP_ID,
+                "keyword": barcode,
+                "hits": 1,
+                "format": "json",
+            },
+            timeout=5,
+        )
+        items = res.json().get("Items", [])
+        if items:
+            return items[0]["Item"]["itemName"]
+    except Exception:
+        pass
+    return None
+
+
+# ===== デモデータ =====
+def seed_demo_data():
+    """在庫（期限が近い/切れ/余裕あり）と、過去の消費・廃棄の履歴を投入する。"""
+    today = datetime.date.today()
+    now = datetime.datetime.now()
+
+    stock = [
+        ("一般食品", "牛乳", today + datetime.timedelta(days=1), 198),
+        ("一般食品", "卵", today + datetime.timedelta(days=2), 250),
+        ("一般食品", "ほうれん草", today + datetime.timedelta(days=-1), 180),
+        ("一般食品", "鶏むね肉", today + datetime.timedelta(days=5), 480),
+        ("一般食品", "豆腐", today + datetime.timedelta(days=4), 98),
+        ("防災食", "アルファ米", today + datetime.timedelta(days=20), 400),
+        ("防災食", "缶詰パン", today + datetime.timedelta(days=300), 450),
+        ("調味料", "しょうゆ", today + datetime.timedelta(days=200), 280),
+        ("調味料", "みりん", today + datetime.timedelta(days=25), 320),
+    ]
+    for ft, name, d, price in stock:
+        fmt = "%Y-%m-%d" if ft == "一般食品" else "%Y-%m"
+        insert_item(ft, name, d.strftime(fmt), price)
+
+    # (区分, 名前, 金額, 何日前に消費/廃棄したか, ステータス)
+    history = [
+        ("一般食品", "キャベツ", 198, 5, STATUS_CONSUMED),
+        ("一般食品", "ヨーグルト", 150, 12, STATUS_CONSUMED),
+        ("一般食品", "豚こま肉", 520, 20, STATUS_CONSUMED),
+        ("一般食品", "トマト", 280, 28, STATUS_DISCARDED),
+        ("一般食品", "鮭の切り身", 600, 40, STATUS_CONSUMED),
+        ("一般食品", "もやし", 40, 45, STATUS_DISCARDED),
+        ("一般食品", "納豆", 100, 55, STATUS_CONSUMED),
+        ("一般食品", "きゅうり", 120, 70, STATUS_DISCARDED),
+        ("一般食品", "鶏もも肉", 550, 75, STATUS_CONSUMED),
+        ("一般食品", "ハム", 230, 85, STATUS_CONSUMED),
+    ]
+    for ft, name, price, days_ago, status in history:
+        closed = now - datetime.timedelta(days=days_ago)
+        insert_item(
+            ft,
+            name,
+            closed.strftime("%Y-%m-%d"),
+            price,
+            status=status,
+            closed_at=closed.isoformat(timespec="seconds"),
+        )
+
+
+# ===== パスワード =====
+def require_password():
+    """APP_PASSWORD が設定されている場合のみ、共通パスワードを要求する。"""
+    if not APP_PASSWORD or st.session_state.get("authed"):
+        return
+    st.title("🥕 AIスマートキッチン")
+    pw = st.text_input("パスワード", type="password")
+    if pw:
+        if pw == APP_PASSWORD:
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("パスワードが違います。")
+    st.stop()
 
 
 # ===== UI =====
 def main():
-    st.set_page_config(
-        page_title="AIスマートキッチン",
-        page_icon="🥕",
-        layout="wide",
-    )
+    st.set_page_config(page_title="AIスマートキッチン", page_icon="🥕", layout="wide")
 
     init_db()
+    require_password()
 
     st.markdown(
         """
@@ -398,28 +468,46 @@ def main():
         .danger { color: #b22222; font-weight: 600; }
         .warning { color: #ff8c00; font-weight: 600; }
         .safe { color: #2e8b57; font-weight: 600; }
+        .unknown { color: #6b7280; font-weight: 600; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown(
-        '<div class="main-title">AIスマートキッチン</div>',
-        unsafe_allow_html=True,
-    )
+    # ----- サイドバー：デモ用ツール -----
+    with st.sidebar:
+        st.subheader("🛠 デモ用ツール")
+        if st.button("デモデータを投入", use_container_width=True):
+            seed_demo_data()
+            st.session_state["toast_msg"] = "デモデータを投入しました"
+            st.rerun()
+        with st.expander("全データを削除"):
+            confirm = st.checkbox("本当に全て削除する")
+            if st.button("削除を実行", disabled=not confirm):
+                delete_all_items()
+                st.session_state["toast_msg"] = "全データを削除しました"
+                st.rerun()
+
+    st.markdown('<div class="main-title">AIスマートキッチン</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-title">家庭内のフードロスを「見える化」して、賢くおいしく使い切る。</div>',
         unsafe_allow_html=True,
     )
 
+    if st.session_state.get("toast_msg"):
+        st.toast(st.session_state.pop("toast_msg"), icon="✅")
+
     if not GEMINI_API_KEY:
-        st.error("⚠️ GEMINI_API_KEY が読み込まれていません。.env ファイルの場所と中身を確認してください（画像解析・音声解析・OCR・レシピ提案が全て動きません）。")
+        st.error(
+            "⚠️ GEMINI_API_KEY が読み込まれていません。Secrets（または .env）を確認してください"
+            "（画像解析・音声解析・レシピ提案が動きません）。"
+        )
     if not PYZBAR_AVAILABLE:
         st.warning(f"⚠️ バーコード読み取り機能が無効です: {PYZBAR_IMPORT_ERROR}")
 
     st.write("---")
 
-    all_items = fetch_items(status_filter="在庫")
+    all_items = fetch_items(status_filter=STATUS_STOCK)
 
     near_items = []
     risk_amount = 0
@@ -429,9 +517,7 @@ def main():
             near_items.append((item, days_left))
             risk_amount += item["price"]
 
-    import streamlit.components.v1 as components
-
-    discarded_items = fetch_items(status_filter="廃棄")
+    discarded_items = fetch_items(status_filter=STATUS_DISCARDED)
     total_discarded_price = sum(i["price"] for i in discarded_items)
 
     tilt_score = 0
@@ -445,37 +531,39 @@ def main():
     tilt_score += total_discarded_price * 2
     angle = min(45, tilt_score / 500)
 
-    near_names = [item["name"] for item, _ in near_items[:4]]
-    safe_names = [item["name"] for item in all_items
-                  if not is_near_expiry(item["food_type"], calc_days_left(item["expiry_date"]))][:4]
+    # JS の innerHTML に入る文字列は必ずエスケープする
+    near_names = [html.escape(item["name"]) for item, _ in near_items[:4]]
+    safe_names = [
+        html.escape(item["name"])
+        for item in all_items
+        if not is_near_expiry(item["food_type"], calc_days_left(item["expiry_date"]))
+    ][:4]
 
-    balance_data = json.dumps({
-        "angle": round(angle, 1),
-        "risk": int(risk_amount),
-        "discarded": int(total_discarded_price),
-        "near_count": len(near_items),
-        "near_names": near_names,
-        "safe_names": safe_names,
-        "shake": angle > 10,
-    })
+    balance_data = json.dumps(
+        {
+            "angle": round(angle, 1),
+            "risk": int(risk_amount),
+            "discarded": int(total_discarded_price),
+            "near_count": len(near_items),
+            "near_names": near_names,
+            "safe_names": safe_names,
+            "shake": angle > 10,
+        }
+    )
 
     home_col1, home_col2 = st.columns([1, 1])
 
     with home_col1:
         st.subheader("📢 期限接近アラート")
         if near_items:
-            st.warning(
-                f"期限が近い食材があります。想定廃棄リスク額：{int(risk_amount)} 円"
-            )
-            for item, days_left in near_items:
+            st.warning(f"期限が近い食材があります。想定廃棄リスク額：{int(risk_amount)} 円")
+            for item, days_left in sorted(near_items, key=lambda x: x[1]):
                 level = judge_threshold(item["food_type"], days_left)
-                cls = (
-                    "danger"
-                    if level == "赤"
-                    else ("warning" if level == "黄" else "safe")
-                )
+                cls = level_css_class(level)
                 st.markdown(
-                    f'<span class="{cls}">[{item["food_type"]}] {item["name"]}：あと {days_left} 日（期限 {item["expiry_date"]}）</span>',
+                    f'<span class="{cls}">[{html.escape(item["food_type"])}] '
+                    f'{html.escape(item["name"])}：あと {days_left} 日'
+                    f'（期限 {html.escape(item["expiry_date"])}）</span>',
                     unsafe_allow_html=True,
                 )
         else:
@@ -535,29 +623,31 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
     with tab_register:
         st.header("食材登録")
 
-        # 直前の読み取り結果をトースト表示（rerun後に一度だけ）
-        if st.session_state.get("toast_msg"):
-            st.toast(st.session_state.pop("toast_msg"), icon="✅")
-
         prefill = st.session_state.get("prefill", {})
-        if "cam_key" not in st.session_state:
-            st.session_state["cam_key"] = 0
-        if "expiry_cam_key" not in st.session_state:
-            st.session_state["expiry_cam_key"] = 0
-        if "form_key" not in st.session_state:
-            st.session_state["form_key"] = 0
+        for k in ("cam_key", "expiry_cam_key", "form_key"):
+            if k not in st.session_state:
+                st.session_state[k] = 0
 
-        # ── 商品名欄 ──────────────────────────────
+        # ── 1. 商品名 ──
         st.subheader("1. 商品名")
         name_col, barcode_col = st.columns([5, 1])
         with name_col:
-            name = st.text_input("食材名", value=prefill.get("name", ""), placeholder="例：卵", label_visibility="collapsed", key=f"name_{st.session_state['form_key']}")
+            name = st.text_input(
+                "食材名",
+                value=prefill.get("name", ""),
+                placeholder="例：卵",
+                label_visibility="collapsed",
+                key=f"name_{st.session_state['form_key']}",
+            )
         with barcode_col:
             if st.button("📷 バーコード", key="open_barcode_cam", disabled=not PYZBAR_AVAILABLE):
                 st.session_state["show_barcode_cam"] = not st.session_state.get("show_barcode_cam", False)
 
         if st.session_state.get("show_barcode_cam"):
-            img = st.camera_input("バーコードを撮影（できるだけ大きく・明るく・ピントを合わせて）", key=f"camera_{st.session_state['cam_key']}")
+            img = st.camera_input(
+                "バーコードを撮影（できるだけ大きく・明るく・ピントを合わせて）",
+                key=f"camera_{st.session_state['cam_key']}",
+            )
             bc1, bc2 = st.columns(2)
             with bc1:
                 if img and st.button("バーコードを読み取る", key="cam_barcode"):
@@ -571,7 +661,7 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
                             prefill["name"] = found_name
                             st.session_state["prefill"] = prefill
                             st.session_state["show_barcode_cam"] = False
-                            st.session_state["form_key"] += 1  # ウィジェットを作り直して新しい値を反映させる
+                            st.session_state["form_key"] += 1
                             st.session_state["toast_msg"] = f"商品名を読み取りました：{found_name}"
                             st.rerun()
                         else:
@@ -579,7 +669,9 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
                                 f"バーコード番号（{barcode}）は読み取れましたが、商品名が見つかりませんでした。手動で入力してください。"
                             )
                     else:
-                        st.warning("バーコードを検出できませんでした。バーコードが画面全体に大きく、水平に、ピントが合った状態で写るように再撮影してください。")
+                        st.warning(
+                            "バーコードを検出できませんでした。バーコードが画面全体に大きく、水平に、ピントが合った状態で写るように再撮影してください。"
+                        )
             with bc2:
                 if st.button("📷 再撮影", key="cam_reset"):
                     st.session_state["cam_key"] += 1
@@ -587,24 +679,22 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
 
         st.write("")
 
-        # ── 区分・金額 ────────────────────────────
+        # ── 2. 区分・金額 ──
         st.subheader("2. 区分・金額")
         current_type = prefill.get("food_type", "一般食品")
-        if current_type not in ["一般食品", "防災食", "調味料"]:
+        if current_type not in FOOD_TYPES:
             current_type = "一般食品"
         type_col, price_col = st.columns(2)
         with type_col:
-            food_type = st.selectbox(
-                "区分",
-                ["一般食品", "防災食", "調味料"],
-                index=["一般食品", "防災食", "調味料"].index(current_type),
-            )
+            food_type = st.selectbox("区分", FOOD_TYPES, index=FOOD_TYPES.index(current_type))
         with price_col:
-            price = st.number_input("購入金額（円）", min_value=0, value=int(prefill.get("price", 0)))
+            price = st.number_input(
+                "購入金額（円）", min_value=0, value=int(prefill.get("price", 0) or 0)
+            )
 
         st.write("")
 
-        # ── 賞味期限 ──────────────────────────────
+        # ── 3. 賞味期限 ──
         st.subheader("3. 賞味期限")
         today = datetime.date.today()
         if food_type == "一般食品":
@@ -624,30 +714,41 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
 
         expiry_col, expiry_cam_col = st.columns([5, 1])
         with expiry_col:
-            expiry_date_str = st.text_input(expiry_label, value=default_date_str, placeholder=f"例：{default_date_str}", label_visibility="collapsed", key=f"expiry_{st.session_state['form_key']}")
+            # 区分を変えたときに書式が合うよう、key に区分を含めてリセットする
+            expiry_date_str = st.text_input(
+                expiry_label,
+                value=default_date_str,
+                placeholder=f"例：{default_date_str}",
+                label_visibility="collapsed",
+                key=f"expiry_{st.session_state['form_key']}_{food_type}",
+            )
         with expiry_cam_col:
             if st.button("📷 撮影", key="open_expiry_cam"):
                 st.session_state["show_expiry_cam"] = not st.session_state.get("show_expiry_cam", False)
 
         if st.session_state.get("show_expiry_cam"):
-            expiry_img = st.camera_input("賞味期限部分を撮影（数字がはっきり写るように近づけてください）", key=f"expiry_camera_{st.session_state['expiry_cam_key']}")
+            expiry_img = st.camera_input(
+                "賞味期限部分を撮影（数字がはっきり写るように近づけてください）",
+                key=f"expiry_camera_{st.session_state['expiry_cam_key']}",
+            )
             ec1, ec2 = st.columns(2)
             with ec1:
                 if expiry_img and st.button("賞味期限を読み取る", key="read_expiry"):
                     with st.spinner("画像を解析中..."):
-                        # st.camera_input は JPEG を返すので mime_type はデフォルトのままでOK
                         data = analyze_image_with_gemini(expiry_img.getvalue(), mime_type="image/jpeg")
                     if data and data.get("expiry_date"):
                         prefill["expiry_date"] = data["expiry_date"]
                         st.session_state["prefill"] = prefill
                         st.session_state["show_expiry_cam"] = False
-                        st.session_state["form_key"] += 1  # ウィジェットを作り直して新しい値を反映させる
+                        st.session_state["form_key"] += 1
                         st.session_state["toast_msg"] = f"賞味期限を読み取りました：{data['expiry_date']}"
                         st.rerun()
                     elif data:
-                        st.warning("画像は解析できましたが、賞味期限の日付が見つかりませんでした。日付部分がはっきり写るように近づけて再撮影してください。")
+                        st.warning(
+                            "画像は解析できましたが、賞味期限の日付が見つかりませんでした。日付部分がはっきり写るように近づけて再撮影してください。"
+                        )
                     else:
-                        st.warning("賞味期限を読み取れませんでした。手動で入力してください。（上に表示されたエラー内容も確認してください）")
+                        st.warning("賞味期限を読み取れませんでした。手動で入力してください。")
             with ec2:
                 if st.button("📷 再撮影", key="expiry_cam_reset"):
                     st.session_state["expiry_cam_key"] += 1
@@ -655,68 +756,85 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
 
         st.write("")
 
-        # ── 音声入力────────────────────────
+        # ── 音声入力 ──
         with st.expander("🎙 音声で一括入力"):
             st.write("例：「卵 200円 一般食品 5月20日」などと話してください。")
             audio = st.audio_input("音声を録音", key=f"audio_{st.session_state['form_key']}")
             if audio is not None:
                 if st.button("音声から情報を解析", key="audio_analyze"):
                     with st.spinner("音声を解析中..."):
-                        mime_type = getattr(audio, "type", "audio/wav")
+                        mime_type = getattr(audio, "type", None) or "audio/wav"
                         data = analyze_audio_with_gemini(audio.getvalue(), mime_type=mime_type)
                     if data:
                         st.session_state["prefill"] = data
-                        st.session_state["form_key"] += 1  # ウィジェットを作り直して新しい値を反映させる
+                        st.session_state["form_key"] += 1
                         st.session_state["toast_msg"] = f"音声から読み取りました：{data.get('name', '')}"
                         st.rerun()
 
-        # ── 画像アップロード────────────────
+        # ── 画像アップロード ──
         with st.expander("🖼 画像アップロードで一括入力"):
-            st.write("レシートやパッケージ画像をアップロードします。")
-            up = st.file_uploader("画像ファイルを選択", type=["png", "jpg", "jpeg"], key=f"upload_{st.session_state['form_key']}")
+            st.write("パッケージ画像をアップロードします。")
+            up = st.file_uploader(
+                "画像ファイルを選択",
+                type=["png", "jpg", "jpeg"],
+                key=f"upload_{st.session_state['form_key']}",
+            )
             if up is not None:
                 if st.button("画像から情報を解析", key="upload_analyze"):
                     with st.spinner("画像を解析中..."):
-                        # アップロードされたファイルの実際の形式(up.type)をそのまま渡す
-                        # （固定で "image/jpeg" にしていたのが PNG アップロード時の失敗の原因だった）
                         actual_mime = up.type or "image/jpeg"
                         data = analyze_image_with_gemini(up.read(), mime_type=actual_mime)
                     if data:
                         st.session_state["prefill"] = data
-                        st.session_state["form_key"] += 1  # ウィジェットを作り直して新しい値を反映させる
-                        st.session_state["toast_msg"] = f"解析結果：{data.get('name', '')} / {data.get('food_type', '')} / {data.get('expiry_date', '')}"
+                        st.session_state["form_key"] += 1
+                        st.session_state["toast_msg"] = (
+                            f"解析結果：{data.get('name', '')} / {data.get('food_type', '')} / {data.get('expiry_date', '')}"
+                        )
                         st.rerun()
                     else:
-                        st.warning("画像から情報を読み取れませんでした。パッケージ全体・商品名・賞味期限表示がはっきり写った写真で試してください。")
+                        st.warning(
+                            "画像から情報を読み取れませんでした。パッケージ全体・商品名・賞味期限表示がはっきり写った写真で試してください。"
+                        )
 
         st.write("")
 
-        # ── 登録ボタン ────────────────────────────
+        # ── 登録ボタン（st.stop() は使わず、他のタブの描画を止めない） ──
         if st.button("✅ この内容で登録する", key="manual_register", type="primary"):
-            if not name:
-                st.error("食材名を入力してください。")
-                st.stop()
-            try:
-                datetime.datetime.strptime(expiry_date_str, expiry_fmt)
-            except ValueError:
-                st.error(f"賞味期限の形式が正しくありません。{expiry_hint} で入力してください。")
-                st.stop()
-            insert_item(food_type=food_type, name=name, expiry_date=expiry_date_str, price=price, status="在庫")
-            st.success("在庫に登録しました。")
-            st.balloons()
-            st.session_state.pop("prefill", None)
-            st.session_state["show_barcode_cam"] = False
-            st.session_state["show_expiry_cam"] = False
-            st.session_state["form_key"] += 1  # 入力欄を空の状態にリセットする
-            st.rerun()
+            error_msg = None
+            if not name.strip():
+                error_msg = "食材名を入力してください。"
+            else:
+                try:
+                    datetime.datetime.strptime(expiry_date_str.strip(), expiry_fmt)
+                except ValueError:
+                    error_msg = f"賞味期限の形式が正しくありません。{expiry_hint} で入力してください。"
+
+            if error_msg:
+                st.error(error_msg)
+            else:
+                insert_item(
+                    food_type=food_type,
+                    name=name.strip(),
+                    expiry_date=expiry_date_str.strip(),
+                    price=price,
+                    status=STATUS_STOCK,
+                )
+                st.session_state.pop("prefill", None)
+                st.session_state["show_barcode_cam"] = False
+                st.session_state["show_expiry_cam"] = False
+                st.session_state["form_key"] += 1
+                st.session_state["toast_msg"] = "在庫に登録しました"
+                st.rerun()
 
     # ===== 在庫一覧タブ =====
     with tab_stock:
         st.header("在庫一覧")
-        all_stock = fetch_items(status_filter="在庫")
+        all_stock = fetch_items(status_filter=STATUS_STOCK)
         total_stock_price = sum(i["price"] for i in all_stock)
         st.metric("現在の在庫合計金額", f"{int(total_stock_price):,} 円")
 
+        if "stock_sort" not in st.session_state:
+            st.session_state["stock_sort"] = "id"
         sort_col1, sort_col2 = st.columns(2)
         with sort_col1:
             if st.button("登録順", key="sort_id", use_container_width=True):
@@ -724,21 +842,17 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
         with sort_col2:
             if st.button("賞味期限順", key="sort_expiry", use_container_width=True):
                 st.session_state["stock_sort"] = "expiry"
-        if "stock_sort" not in st.session_state:
-            st.session_state["stock_sort"] = "id"
         sort_label = "登録順" if st.session_state["stock_sort"] == "id" else "賞味期限順"
         st.caption(f"現在の並び順：{sort_label}")
         st.write("---")
-        food_tab1, food_tab2, food_tab3 = st.tabs(
-            ["一般食品", "防災食", "調味料"]
-        )
+
+        food_tab1, food_tab2, food_tab3 = st.tabs(FOOD_TYPES)
 
         def render_stock_table(food_type_label):
-            items = fetch_items(
-                status_filter="在庫", food_type_filter=food_type_label
-            )
+            items = fetch_items(status_filter=STATUS_STOCK, food_type_filter=food_type_label)
             if st.session_state.get("stock_sort") == "expiry":
-                items = sorted(items, key=lambda x: x["expiry_date"])
+                # 文字列ではなく「残り日数」で並べる（YYYY-MM と YYYY-MM-DD が混在しても正しい）
+                items = sorted(items, key=sort_key_days)
             if not items:
                 st.info("在庫はありません。")
                 return
@@ -746,12 +860,7 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
             for item in items:
                 days_left = calc_days_left(item["expiry_date"])
                 level = judge_threshold(item["food_type"], days_left)
-                cls = (
-                    "danger"
-                    if level == "赤"
-                    else ("warning" if level == "黄" else "safe")
-                )
-
+                cls = level_css_class(level)
                 edit_key = f"editing_{item['id']}"
 
                 if st.session_state.get(edit_key):
@@ -760,21 +869,38 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
                         ec1, ec2 = st.columns(2)
                         with ec1:
                             new_name = st.text_input("食材名", value=item["name"], key=f"ename_{item['id']}")
-                            current_type = item["food_type"] if item["food_type"] in ["一般食品", "防災食", "調味料"] else "一般食品"
-                            new_type = st.selectbox("区分", ["一般食品", "防災食", "調味料"], index=["一般食品", "防災食", "調味料"].index(current_type), key=f"etype_{item['id']}")
+                            cur = item["food_type"] if item["food_type"] in FOOD_TYPES else "一般食品"
+                            new_type = st.selectbox(
+                                "区分",
+                                FOOD_TYPES,
+                                index=FOOD_TYPES.index(cur),
+                                key=f"etype_{item['id']}",
+                            )
                         with ec2:
-                            new_expiry = st.text_input("賞味期限（YYYY-MM-DD）", value=item["expiry_date"], key=f"eexpiry_{item['id']}")
-                            new_price = st.number_input("金額（円）", min_value=0, value=int(item["price"]), key=f"eprice_{item['id']}")
+                            new_expiry = st.text_input(
+                                "賞味期限（YYYY-MM-DD または YYYY-MM）",
+                                value=item["expiry_date"],
+                                key=f"eexpiry_{item['id']}",
+                            )
+                            new_price = st.number_input(
+                                "金額（円）",
+                                min_value=0,
+                                value=int(item["price"]),
+                                key=f"eprice_{item['id']}",
+                            )
                         sc1, sc2 = st.columns(2)
                         with sc1:
                             if st.button("保存", key=f"save_{item['id']}"):
-                                try:
-                                    datetime.datetime.strptime(new_expiry, "%Y-%m-%d")
-                                    update_item(item["id"], new_name, new_type, new_expiry, new_price)
+                                expiry_clean = new_expiry.strip()
+                                if not new_name.strip():
+                                    st.error("食材名を入力してください。")
+                                elif len(expiry_clean) not in (7, 10) or parse_expiry(expiry_clean) is None:
+                                    # 登録時と同じく YYYY-MM-DD / YYYY-MM の両方を受け付ける
+                                    st.error("賞味期限は YYYY-MM-DD または YYYY-MM 形式で入力してください。")
+                                else:
+                                    update_item(item["id"], new_name.strip(), new_type, expiry_clean, new_price)
                                     st.session_state[edit_key] = False
                                     st.rerun()
-                                except ValueError:
-                                    st.error("賞味期限はYYYY-MM-DD形式で入力してください。")
                         with sc2:
                             if st.button("キャンセル", key=f"cancel_{item['id']}"):
                                 st.session_state[edit_key] = False
@@ -786,7 +912,7 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
                     with col1:
                         st.write(f"**{item['name']}**")
                         st.markdown(
-                            f"あと <span class='{cls}'>{days_left} 日</span>",
+                            f"あと <span class='{cls}'>{days_label(days_left)}</span>",
                             unsafe_allow_html=True,
                         )
                     with col2:
@@ -799,11 +925,11 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
                         c1, c2, c3 = st.columns(3)
                         with c1:
                             if st.button("消費", key=f"consume_{item['id']}"):
-                                update_status(item["id"], "消費済み")
+                                update_status(item["id"], STATUS_CONSUMED)
                                 st.rerun()
                         with c2:
                             if st.button("廃棄", key=f"discard_{item['id']}"):
-                                update_status(item["id"], "廃棄")
+                                update_status(item["id"], STATUS_DISCARDED)
                                 st.rerun()
                         with c3:
                             if st.button("編集", key=f"edit_{item['id']}"):
@@ -821,53 +947,46 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
     # ===== レシピ提案タブ =====
     with tab_recipe:
         st.header("レシピ提案（使う食材を選択）")
-        items = fetch_items(status_filter="在庫")
+        items = fetch_items(status_filter=STATUS_STOCK)
         if not items:
             st.info("在庫がありません。まずは食材を登録してください。")
         else:
-            items_sorted = sorted(
-                items, key=lambda x: calc_days_left(x["expiry_date"])
-            )
-            def expiry_mark(item):
-                days_left = calc_days_left(item["expiry_date"])
-                level = judge_threshold(item["food_type"], days_left)
-                if level == "赤":
-                    return "🔴"
-                elif level == "黄":
-                    return "🟡"
-                return ""
+            items_sorted = sorted(items, key=sort_key_days)
 
-            options = [
-                f"{expiry_mark(item)}[{item['food_type']}] {item['name']}（期限 {item['expiry_date']}）"
-                for item in items_sorted
-            ]
+            def expiry_mark(item):
+                level = judge_threshold(item["food_type"], calc_days_left(item["expiry_date"]))
+                return {"赤": "🔴", "黄": "🟡"}.get(level, "")
+
+            # ラベルが重複しても選択がずれないよう、ID付きの辞書で管理する
+            label_to_item = {}
+            for item in items_sorted:
+                label = (
+                    f"{expiry_mark(item)}[{item['food_type']}] {item['name']}"
+                    f"（期限 {item['expiry_date']}）#{item['id']}"
+                )
+                label_to_item[label] = item
+
             selected = st.multiselect(
-                "レシピに使いたい食材を選んでください", options
+                "レシピに使いたい食材を選んでください", list(label_to_item.keys())
             )
 
             if st.button("レシピを生成する"):
                 if not selected:
                     st.warning("少なくとも1つは食材を選んでください。")
                 else:
-                    selected_items = []
-                    for label, item in zip(options, items_sorted):
-                        if label in selected:
-                            selected_items.append(item)
+                    selected_items = [label_to_item[l] for l in selected]
                     with st.spinner("レシピを生成中..."):
-                        recipe_text = generate_recipe_with_gemini(
-                            selected_items
-                        )
-                    st.subheader("提案レシピ")
-                    st.write(recipe_text)
+                        recipe_text = generate_recipe_with_gemini(selected_items)
+                    if recipe_text:
+                        st.subheader("提案レシピ")
+                        st.write(recipe_text)
 
     # ===== 履歴・フードロス可視化タブ =====
     with tab_history:
         st.header("履歴・フードロス可視化")
-        import pandas as pd
-        import plotly.express as px
 
-        consumed = fetch_items(status_filter="消費済み")
-        discarded = fetch_items(status_filter="廃棄")
+        consumed = fetch_items(status_filter=STATUS_CONSUMED)
+        discarded = fetch_items(status_filter=STATUS_DISCARDED)
 
         total_consumed = sum(i["price"] for i in consumed)
         total_discarded = sum(i["price"] for i in discarded)
@@ -883,23 +1002,34 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
         all_history = consumed + discarded
         if all_history:
             df = pd.DataFrame(all_history)
-            df["month"] = df["expiry_date"].str[:7]
+            # 「消費・廃棄した月」で集計（closed_at が無い古いデータは期限の月で代用）
+            df["month"] = df.apply(
+                lambda r: (r["closed_at"] or r["expiry_date"])[:7], axis=1
+            )
 
             st.write("---")
             st.subheader("月別：消費・廃棄の推移")
-            df_trend = df.pivot_table(
-                index="month", columns="status", values="price", aggfunc="sum", fill_value=0
-            ).reindex(columns=["消費済み", "廃棄"], fill_value=0)
-            df_trend_reset = df_trend.reset_index()
+            df_trend = (
+                df.pivot_table(
+                    index="month", columns="status", values="price", aggfunc="sum", fill_value=0
+                )
+                .reindex(columns=[STATUS_CONSUMED, STATUS_DISCARDED], fill_value=0)
+                .reset_index()
+            )
             fig_line = px.line(
-                df_trend_reset, x="month",
-                y=["消費済み", "廃棄"],
-                color_discrete_map={"消費済み": "#2e8b57", "廃棄": "#b22222"},
+                df_trend,
+                x="month",
+                y=[STATUS_CONSUMED, STATUS_DISCARDED],
+                color_discrete_map={STATUS_CONSUMED: "#2e8b57", STATUS_DISCARDED: "#b22222"},
                 markers=True,
             )
-            fig_line.update_layout(yaxis=dict(rangemode="nonnegative"), xaxis_title="月", yaxis_title="金額（円）")
+            fig_line.update_layout(
+                yaxis=dict(rangemode="nonnegative"),
+                xaxis_title="月",
+                yaxis_title="金額（円）",
+                legend_title_text="",
+            )
             st.plotly_chart(fig_line, use_container_width=True)
-
         else:
             st.info("まだ消費・廃棄の履歴がありません。")
 
@@ -911,9 +1041,11 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
             if not items:
                 st.write("なし")
                 return
-            for item in items:
+            for item in sorted(items, key=lambda x: x["closed_at"] or "", reverse=True):
+                closed = f" / 記録日 {item['closed_at'][:10]}" if item["closed_at"] else ""
                 st.write(
-                    f"- [{item['food_type']}] {item['name']} / 期限 {item['expiry_date']} / 金額 {int(item['price'])} 円"
+                    f"- [{item['food_type']}] {item['name']} / 期限 {item['expiry_date']}"
+                    f" / 金額 {int(item['price'])} 円{closed}"
                 )
 
         render_history("😊消費済み", consumed)

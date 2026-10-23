@@ -1,10 +1,10 @@
-streamlit
-opencv-python-headless
-numpy
-pyzbar
+streamlit>=1.40
 google-genai
 pydantic
 python-dotenv
+opencv-python-headless
+numpy
+pyzbar
+requests
 pandas
 plotly
-requests
