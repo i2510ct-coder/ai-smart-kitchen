@@ -618,6 +618,8 @@ def main():
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;500;700&display=swap');
         html, body, .stApp, .stApp * { font-family: 'Zen Maru Gothic', 'Hiragino Maru Gothic ProN', 'Meiryo', sans-serif; }
+        [data-testid="stIconMaterial"], .material-symbols-rounded, .material-symbols-outlined, .material-icons {
+            font-family: 'Material Symbols Rounded', 'Material Symbols Outlined', 'Material Icons' !important; }
         .stApp { background: linear-gradient(180deg, #fff8f0 0%, #fff0f3 100%); }
         section[data-testid="stSidebar"] { background: #ffeef2; }
         .hero { background: linear-gradient(135deg, #ffd6e0, #ffe9b8); border-radius: 28px;
