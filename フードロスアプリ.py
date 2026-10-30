@@ -732,12 +732,13 @@ def main():
         for i in all_items
         if not is_near_expiry(i["food_type"], calc_days_left(i["expiry_date"]))
     )
-    # 左（😋）：食べた金額 + まだ余裕のある在庫 / 右（🥺）：期限が近い在庫 + 捨てた金額
+    # 「もったいない」= 期限が近い在庫 + 捨てた金額 / それ以外 = 食べた金額 + まだ余裕のある在庫
     bad_weight = risk_amount + total_discarded_price
     good_weight = total_consumed_price + safe_stock_price
     total_weight = bad_weight + good_weight
     if total_weight > 0:
-        angle = max(-30, min(30, (bad_weight - good_weight) / total_weight * 40))
+        waste_share = bad_weight / total_weight  # 全体のうち「もったいない」の割合
+        angle = min(20, waste_share * 40)  # 0度（水平）〜20度。右が下がる
     else:
         angle = 0
 
@@ -751,9 +752,9 @@ def main():
 
     if total_weight == 0:
         mood = "🍽️ まだ食材がないよ。まずは登録してみよう"
-    elif angle < -3:
+    elif angle < 3:
         mood = "🌸 いい感じ！この調子で食べきろう"
-    elif angle < 8:
+    elif angle < 14:
         mood = "⏰ ちょっと心配…早めに使ってあげてね"
     else:
         mood = "🚨 たいへん！今日は使い切りメニューにしよう"
@@ -767,7 +768,7 @@ def main():
             "near_count": len(near_items),
             "near_names": near_names,
             "safe_names": safe_names,
-            "shake": angle > 12,
+            "shake": angle > 14,
         }
     )
 
@@ -791,7 +792,7 @@ def main():
 
     with home_col2:
         st.subheader("⚖️ フードロス天秤")
-        st.caption("食べた・まだ余裕のある食材が多いと左😋、期限が近い・捨てた食材が多いと右🥺に傾くよ")
+        st.caption("水平ならバッチリ！期限が近い・捨てた食材が増えると、右（ごみ箱側）が下がるよ")
         html_balance = """<!DOCTYPE html>
 <html lang="ja"><head><meta charset="UTF-8">
 <link href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@500;700&display=swap" rel="stylesheet">
@@ -800,10 +801,10 @@ body{font-family:'Zen Maru Gothic','Hiragino Maru Gothic ProN','Meiryo',sans-ser
 @keyframes sway{0%{transform:rotate(var(--a))}50%{transform:rotate(calc(var(--a) + var(--amp)))}100%{transform:rotate(var(--a))}}
 .sway{animation:sway 2.4s ease-in-out infinite;}
 .mood{display:block;width:fit-content;margin:0 auto 4px;background:#fff;border:2px solid #ffc2cf;border-radius:999px;padding:4px 16px;font-size:13px;font-weight:700;color:#e0566f;}
-.wrap{position:relative;height:130px;display:flex;align-items:center;justify-content:center;}
+.wrap{position:relative;height:170px;display:flex;align-items:center;justify-content:center;}
 .wrap::after{content:"";position:absolute;left:50%;top:calc(50% + 6px);width:30px;height:38px;background:#ff8fa3;transform:translateX(-50%);clip-path:polygon(50% 0%,0% 100%,100% 100%);}
-.seesaw{width:300px;height:16px;background:linear-gradient(90deg,#ffb3c1,#ffd59e,#ffb3c1);border-radius:999px;position:relative;z-index:1;box-shadow:0 3px 8px rgba(255,150,170,.4);transition:transform 1.2s cubic-bezier(0.34,1.56,0.64,1);}
-.end{position:absolute;bottom:12px;font-size:40px;line-height:1;}
+.seesaw{width:260px;height:16px;background:linear-gradient(90deg,#ffb3c1,#ffd59e,#ffb3c1);border-radius:999px;position:relative;z-index:1;box-shadow:0 3px 8px rgba(255,150,170,.4);transition:transform 1.2s cubic-bezier(0.34,1.56,0.64,1);}
+.end{position:absolute;bottom:8px;font-size:32px;line-height:1;}
 .endL{left:-6px;}.endR{right:-6px;}
 .lists{display:flex;justify-content:space-between;gap:8px;font-size:11px;line-height:1.7;min-height:36px;}
 .lists>div{flex:1;}
@@ -815,7 +816,7 @@ body{font-family:'Zen Maru Gothic','Hiragino Maru Gothic ProN','Meiryo',sans-ser
 </style></head><body>
 <div class="mood" id="mood"></div>
 <div class="wrap">
-  <div id="ss" class="seesaw"><div class="end endL">😋</div><div class="end endR">🥺</div></div>
+  <div id="ss" class="seesaw"><div class="end endL">😋</div><div class="end endR" id="rface">🗑️</div></div>
 </div>
 <div class="lists">
   <div class="green" id="safe-list"></div>
@@ -835,13 +836,14 @@ ss.style.animationDuration=d.shake?'0.7s':'2.4s';
 setTimeout(()=>{ss.style.transform='rotate('+d.angle+'deg)';},300);
 setTimeout(()=>{ss.classList.add('sway');},1700);
 document.getElementById('mood').innerText=d.mood;
+document.getElementById('rface').innerText=d.angle<4?'🗑️':(d.angle<10?'😟':'🥺');
 document.getElementById('risk').innerText=d.risk.toLocaleString();
 document.getElementById('disc').innerText=d.discarded.toLocaleString();
 document.getElementById('near').innerText=d.near_count+'件';
 document.getElementById('near-list').innerHTML=d.near_names.map(n=>'⚠️'+n).join('<br>');
 document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join('<br>');
 </script></body></html>"""
-        components.html(html_balance, height=300)
+        components.html(html_balance, height=410)
 
     st.write("---")
 
