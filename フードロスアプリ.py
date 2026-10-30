@@ -19,6 +19,14 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+# ===== supabase ライブラリ（未インストールでもローカル SQLite で動くようにする） =====
+try:
+    from supabase import create_client
+
+    SUPABASE_AVAILABLE = True
+except Exception:
+    SUPABASE_AVAILABLE = False
+
 # ===== pyzbar は zbar 共有ライブラリが無いと import に失敗することがある =====
 try:
     from pyzbar import pyzbar
@@ -46,8 +54,12 @@ MODEL_TEXT = "gemini-2.5-flash"
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 RAKUTEN_APP_ID = get_secret("RAKUTEN_APP_ID")
 APP_PASSWORD = get_secret("APP_PASSWORD")  # 設定されていればパスワード入力を要求
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")  # service_role キー（Secrets にだけ置く）
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY and SUPABASE_AVAILABLE)
 
 FOOD_TYPES = ["一般食品", "防災食", "調味料"]
+TYPE_EMOJI = {"一般食品": "🥬", "防災食": "🥫", "調味料": "🧂"}
 STATUS_STOCK = "在庫"
 STATUS_CONSUMED = "消費済み"
 STATUS_DISCARDED = "廃棄"
@@ -65,12 +77,23 @@ class InventoryItemSchema(BaseModel):
     )
 
 
-# ===== DB =====
+# ===== DB（Supabase の設定があればそちら。無ければローカル SQLite） =====
+ITEM_KEYS = ["id", "food_type", "name", "expiry_date", "price", "status", "closed_at"]
+
+
+@st.cache_resource
+def get_supabase_client():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
 
 def init_db():
+    """SQLite を使う場合だけテーブルを作る（Supabase は SQL エディタで作成済みの前提）。"""
+    if USE_SUPABASE:
+        return
     conn = get_conn()
     c = conn.cursor()
     c.execute(
@@ -86,7 +109,6 @@ def init_db():
         )
         """
     )
-    # 既存DBに closed_at 列が無ければ追加（消費・廃棄した日時）
     c.execute("PRAGMA table_info(inventory)")
     cols = [r[1] for r in c.fetchall()]
     if "closed_at" not in cols:
@@ -95,15 +117,79 @@ def init_db():
     conn.close()
 
 
-def insert_item(food_type, name, expiry_date, price, status=STATUS_STOCK, closed_at=""):
+def _normalize_row(r: dict) -> dict:
+    return {
+        "id": r.get("id"),
+        "food_type": r.get("food_type") or "一般食品",
+        "name": r.get("name") or "",
+        "expiry_date": r.get("expiry_date") or "",
+        "price": float(r.get("price") or 0),
+        "status": r.get("status") or STATUS_STOCK,
+        "closed_at": r.get("closed_at") or "",
+    }
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_all_rows():
+    """全件を1回で取得してキャッシュする（画面1回の描画で何度も通信しないため）。
+    書き込みのたびに _load_all_rows.clear() で破棄する。"""
+    if USE_SUPABASE:
+        res = get_supabase_client().table("inventory").select("*").order("id").execute()
+        return [_normalize_row(r) for r in (res.data or [])]
+
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO inventory (food_type, name, expiry_date, price, status, closed_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (food_type, name, expiry_date, price, status, closed_at),
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, food_type, name, expiry_date, price, status, closed_at "
+        "FROM inventory ORDER BY id"
     )
-    conn.commit()
+    rows = [_normalize_row(dict(zip(ITEM_KEYS, r))) for r in c.fetchall()]
     conn.close()
+    return rows
+
+
+def insert_many(rows):
+    """rows: food_type, name, expiry_date, price, status, closed_at を持つ dict のリスト"""
+    if not rows:
+        return
+    payload = [
+        {
+            "food_type": r["food_type"],
+            "name": r["name"],
+            "expiry_date": r["expiry_date"],
+            "price": float(r.get("price", 0) or 0),
+            "status": r.get("status", STATUS_STOCK),
+            "closed_at": r.get("closed_at", "") or "",
+        }
+        for r in rows
+    ]
+    if USE_SUPABASE:
+        get_supabase_client().table("inventory").insert(payload).execute()
+    else:
+        conn = get_conn()
+        conn.executemany(
+            "INSERT INTO inventory (food_type, name, expiry_date, price, status, closed_at) "
+            "VALUES (:food_type, :name, :expiry_date, :price, :status, :closed_at)",
+            payload,
+        )
+        conn.commit()
+        conn.close()
+    _load_all_rows.clear()
+
+
+def insert_item(food_type, name, expiry_date, price, status=STATUS_STOCK, closed_at=""):
+    insert_many(
+        [
+            {
+                "food_type": food_type,
+                "name": name,
+                "expiry_date": expiry_date,
+                "price": price,
+                "status": status,
+                "closed_at": closed_at,
+            }
+        ]
+    )
 
 
 def update_status(item_id, new_status):
@@ -112,51 +198,107 @@ def update_status(item_id, new_status):
         if new_status != STATUS_STOCK
         else ""
     )
-    conn = get_conn()
-    conn.execute(
-        "UPDATE inventory SET status = ?, closed_at = ? WHERE id = ?",
-        (new_status, closed_at, item_id),
-    )
-    conn.commit()
-    conn.close()
+    if USE_SUPABASE:
+        get_supabase_client().table("inventory").update(
+            {"status": new_status, "closed_at": closed_at}
+        ).eq("id", item_id).execute()
+    else:
+        conn = get_conn()
+        conn.execute(
+            "UPDATE inventory SET status = ?, closed_at = ? WHERE id = ?",
+            (new_status, closed_at, item_id),
+        )
+        conn.commit()
+        conn.close()
+    _load_all_rows.clear()
 
 
 def update_item(item_id, name, food_type, expiry_date, price):
-    conn = get_conn()
-    conn.execute(
-        "UPDATE inventory SET name = ?, food_type = ?, expiry_date = ?, price = ? WHERE id = ?",
-        (name, food_type, expiry_date, price, item_id),
-    )
-    conn.commit()
-    conn.close()
+    if USE_SUPABASE:
+        get_supabase_client().table("inventory").update(
+            {
+                "name": name,
+                "food_type": food_type,
+                "expiry_date": expiry_date,
+                "price": float(price),
+            }
+        ).eq("id", item_id).execute()
+    else:
+        conn = get_conn()
+        conn.execute(
+            "UPDATE inventory SET name = ?, food_type = ?, expiry_date = ?, price = ? WHERE id = ?",
+            (name, food_type, expiry_date, price, item_id),
+        )
+        conn.commit()
+        conn.close()
+    _load_all_rows.clear()
 
 
 def delete_all_items():
-    conn = get_conn()
-    conn.execute("DELETE FROM inventory")
-    conn.commit()
-    conn.close()
+    if USE_SUPABASE:
+        get_supabase_client().table("inventory").delete().gt("id", 0).execute()
+    else:
+        conn = get_conn()
+        conn.execute("DELETE FROM inventory")
+        conn.commit()
+        conn.close()
+    _load_all_rows.clear()
 
 
 def fetch_items(status_filter=None, food_type_filter=None):
-    conn = get_conn()
-    c = conn.cursor()
-    query = (
-        "SELECT id, food_type, name, expiry_date, price, status, closed_at "
-        "FROM inventory WHERE 1=1"
-    )
-    params = []
+    rows = _load_all_rows()
     if status_filter:
-        query += " AND status = ?"
-        params.append(status_filter)
+        rows = [r for r in rows if r["status"] == status_filter]
     if food_type_filter:
-        query += " AND food_type = ?"
-        params.append(food_type_filter)
-    c.execute(query, params)
-    rows = c.fetchall()
-    conn.close()
-    keys = ["id", "food_type", "name", "expiry_date", "price", "status", "closed_at"]
-    return [dict(zip(keys, r)) for r in rows]
+        rows = [r for r in rows if r["food_type"] == food_type_filter]
+    return rows
+
+
+# ===== CSV バックアップ =====
+CSV_COLUMNS = ["food_type", "name", "expiry_date", "price", "status", "closed_at"]
+
+
+def export_items_csv() -> bytes:
+    df = pd.DataFrame(fetch_items(), columns=ITEM_KEYS)[CSV_COLUMNS]
+    return df.to_csv(index=False).encode("utf-8-sig")  # Excel でも文字化けしない
+
+
+def import_items_from_csv(file):
+    """CSV を読み込んで在庫に追加する。戻り値: (追加した件数, 読み飛ばした件数)"""
+    df = pd.read_csv(file, dtype=str).fillna("")
+    required = ["food_type", "name", "expiry_date", "price", "status"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSVに必要な列がありません: {', '.join(missing)}")
+
+    valid_status = {STATUS_STOCK, STATUS_CONSUMED, STATUS_DISCARDED}
+    rows, skipped = [], 0
+    for _, r in df.iterrows():
+        try:
+            price = float(r["price"] or 0)
+        except ValueError:
+            skipped += 1
+            continue
+        if (
+            r["food_type"] not in FOOD_TYPES
+            or r["status"] not in valid_status
+            or not r["name"].strip()
+            or parse_expiry(r["expiry_date"]) is None
+        ):
+            skipped += 1
+            continue
+        rows.append(
+            {
+                "food_type": r["food_type"],
+                "name": r["name"].strip(),
+                "expiry_date": r["expiry_date"].strip(),
+                "price": price,
+                "status": r["status"],
+                "closed_at": r["closed_at"] if "closed_at" in df.columns else "",
+            }
+        )
+    insert_many(rows)
+    return len(rows), skipped
 
 
 # ===== 日付・判定ロジック =====
@@ -407,9 +549,13 @@ def seed_demo_data():
         ("調味料", "しょうゆ", today + datetime.timedelta(days=200), 280),
         ("調味料", "みりん", today + datetime.timedelta(days=25), 320),
     ]
+    rows = []
     for ft, name, d, price in stock:
         fmt = "%Y-%m-%d" if ft == "一般食品" else "%Y-%m"
-        insert_item(ft, name, d.strftime(fmt), price)
+        rows.append(
+            {"food_type": ft, "name": name, "expiry_date": d.strftime(fmt),
+             "price": price, "status": STATUS_STOCK, "closed_at": ""}
+        )
 
     # (区分, 名前, 金額, 何日前に消費/廃棄したか, ステータス)
     history = [
@@ -426,14 +572,12 @@ def seed_demo_data():
     ]
     for ft, name, price, days_ago, status in history:
         closed = now - datetime.timedelta(days=days_ago)
-        insert_item(
-            ft,
-            name,
-            closed.strftime("%Y-%m-%d"),
-            price,
-            status=status,
-            closed_at=closed.isoformat(timespec="seconds"),
+        rows.append(
+            {"food_type": ft, "name": name, "expiry_date": closed.strftime("%Y-%m-%d"),
+             "price": price, "status": status,
+             "closed_at": closed.isoformat(timespec="seconds")}
         )
+    insert_many(rows)
 
 
 # ===== パスワード =====
@@ -459,23 +603,64 @@ def main():
     init_db()
     require_password()
 
+    try:
+        _load_all_rows()
+    except Exception as e:
+        st.error(
+            "データベースに接続できませんでした。Supabase のプロジェクトが一時停止していないか、"
+            "Secrets の SUPABASE_URL / SUPABASE_KEY が正しいか確認してください。\n\n"
+            f"詳細: {e}"
+        )
+        st.stop()
+
     st.markdown(
         """
         <style>
-        body { background-color: #f7f5f0; }
-        .main-title { font-size: 32px; font-weight: 700; color: #0b3c5d; }
-        .sub-title { font-size: 16px; color: #2c7873; }
-        .danger { color: #b22222; font-weight: 600; }
-        .warning { color: #ff8c00; font-weight: 600; }
-        .safe { color: #2e8b57; font-weight: 600; }
-        .unknown { color: #6b7280; font-weight: 600; }
+        @import url('https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;500;700&display=swap');
+        html, body, .stApp, .stApp * { font-family: 'Zen Maru Gothic', 'Hiragino Maru Gothic ProN', 'Meiryo', sans-serif; }
+        .stApp { background: linear-gradient(180deg, #fff8f0 0%, #fff0f3 100%); }
+        section[data-testid="stSidebar"] { background: #ffeef2; }
+        .hero { background: linear-gradient(135deg, #ffd6e0, #ffe9b8); border-radius: 28px;
+                padding: 22px 30px; margin-bottom: 14px; box-shadow: 0 6px 18px rgba(255,150,170,.28); }
+        .main-title { font-size: 30px; font-weight: 700; color: #e0566f; }
+        .sub-title { font-size: 14px; color: #8a6d5b; margin-top: 4px; }
+        .danger { color: #e0405a; font-weight: 700; }
+        .warning { color: #f08a24; font-weight: 700; }
+        .safe { color: #35a37b; font-weight: 700; }
+        .unknown { color: #8a8a8a; font-weight: 700; }
+        .badge { display: inline-block; padding: 2px 12px; border-radius: 999px; background: #fff;
+                 border: 2px solid currentColor; font-size: 13px; }
+        h1, h2, h3 { color: #e0566f !important; }
+        hr { border: none; border-top: 2px dashed #ffd6e0 !important; }
+        .stButton > button, .stDownloadButton > button { border-radius: 999px; border: 2px solid #ffb3c1;
+                 background: #fff; color: #e0566f; font-weight: 700; }
+        .stButton > button:hover, .stDownloadButton > button:hover { background: #ffe3e9; border-color: #ff8fa3; color: #c93a55; }
+        .stButton > button[kind="primary"], button[data-testid="stBaseButton-primary"] {
+                 background: linear-gradient(135deg, #ff8fa3, #ffb36b); color: #fff; border: none;
+                 box-shadow: 0 4px 12px rgba(255,143,163,.45); }
+        .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+        .stTabs [data-baseweb="tab"] { background: #fff; border-radius: 999px; padding: 6px 18px; border: 2px solid #ffd6e0; }
+        .stTabs [aria-selected="true"] { background: #ffd6e0; }
+        .stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display: none; }
+        [data-testid="stMetric"] { background: #fff; border-radius: 22px; padding: 12px 18px;
+                 box-shadow: 0 4px 12px rgba(255,150,170,.18); }
+        [data-testid="stExpander"] { background: #fff; border-radius: 18px; border: 2px solid #ffe0e7; }
+        div[data-testid="stAlert"] { border-radius: 18px; }
+        input, textarea, [data-baseweb="select"] > div { border-radius: 14px !important; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    # ----- サイドバー：デモ用ツール -----
+    # ----- サイドバー -----
     with st.sidebar:
+        if USE_SUPABASE:
+            st.success("💾 保存先：Supabase（再起動しても消えません）")
+        else:
+            st.warning("💾 保存先：ローカルSQLite（クラウドでは再起動で消えます）")
+            if SUPABASE_URL and SUPABASE_KEY and not SUPABASE_AVAILABLE:
+                st.error("supabase ライブラリが未インストールです。requirements.txt を確認してください。")
+
         st.subheader("🛠 デモ用ツール")
         if st.button("デモデータを投入", use_container_width=True):
             seed_demo_data()
@@ -488,9 +673,27 @@ def main():
                 st.session_state["toast_msg"] = "全データを削除しました"
                 st.rerun()
 
-    st.markdown('<div class="main-title">AIスマートキッチン</div>', unsafe_allow_html=True)
+        st.subheader("💾 バックアップ")
+        st.download_button(
+            "CSVでダウンロード",
+            data=export_items_csv(),
+            file_name=f"inventory_{datetime.date.today():%Y%m%d}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        with st.expander("CSVから読み込む（追加されます）"):
+            csv_file = st.file_uploader("CSVファイル", type=["csv"], key="csv_import")
+            if csv_file is not None and st.button("読み込みを実行", key="csv_import_run"):
+                try:
+                    ok, skipped = import_items_from_csv(csv_file)
+                    st.session_state["toast_msg"] = f"{ok}件を読み込みました（読み飛ばし {skipped}件）"
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"読み込みに失敗しました: {e}")
+
     st.markdown(
-        '<div class="sub-title">家庭内のフードロスを「見える化」して、賢くおいしく使い切る。</div>',
+        '<div class="hero"><div class="main-title">🥕 AIスマートキッチン 🍅</div>'
+        '<div class="sub-title">冷蔵庫の「もったいない」を見える化して、おいしく使い切ろう 🍳</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -539,9 +742,17 @@ def main():
         if not is_near_expiry(item["food_type"], calc_days_left(item["expiry_date"]))
     ][:4]
 
+    if angle < 5:
+        mood = "🌸 いい感じ！この調子で食べきろう"
+    elif angle < 15:
+        mood = "⏰ ちょっと心配…早めに使ってあげてね"
+    else:
+        mood = "🚨 たいへん！今日は使い切りメニューにしよう"
+
     balance_data = json.dumps(
         {
             "angle": round(angle, 1),
+            "mood": mood,
             "risk": int(risk_amount),
             "discarded": int(total_discarded_price),
             "near_count": len(near_items),
@@ -556,7 +767,7 @@ def main():
     with home_col1:
         st.subheader("📢 期限接近アラート")
         if near_items:
-            st.warning(f"期限が近い食材があります。想定廃棄リスク額：{int(risk_amount)} 円")
+            st.warning(f"⏰ もうすぐ期限の食材があるよ！このままだと {int(risk_amount)} 円がもったいない…")
             for item, days_left in sorted(near_items, key=lambda x: x[1]):
                 level = judge_threshold(item["food_type"], days_left)
                 cls = level_css_class(level)
@@ -567,51 +778,56 @@ def main():
                     unsafe_allow_html=True,
                 )
         else:
-            st.success("期限が近い食材はありません。いい感じです！")
+            st.success("🎉 いまのところ安心！期限が近い食材はありません")
 
     with home_col2:
         st.subheader("⚖️ フードロス天秤")
-        st.caption("期限切れ間近な食材が多いほど廃棄側に傾きます。")
+        st.caption("期限が近い食材が多いほど、右（もったいない）に傾くよ")
         html_balance = """<!DOCTYPE html>
 <html lang="ja"><head><meta charset="UTF-8">
+<link href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@500;700&display=swap" rel="stylesheet">
 <style>
-body{font-family:'Helvetica Neue',Arial,sans-serif;margin:0;padding:4px 8px;background:linear-gradient(135deg,#fff7ed,#fef3c7);border-radius:12px;}
-@keyframes shake{0%{transform:rotate(var(--a))}25%{transform:rotate(calc(var(--a) + 5deg))}75%{transform:rotate(calc(var(--a) - 5deg))}100%{transform:rotate(var(--a))}}
-.shaking{animation:shake 0.6s ease-in-out infinite;}
-.wrap{position:relative;height:160px;display:flex;align-items:center;justify-content:center;}
-.seesaw{width:380px;height:12px;background:linear-gradient(90deg,#334155,#64748b,#334155);border-radius:6px;position:relative;transition:transform 1.2s cubic-bezier(0.34,1.56,0.64,1);}
-.seesaw::after{content:"";position:absolute;bottom:-22px;left:50%;width:22px;height:22px;background:#1e293b;transform:translateX(-50%);clip-path:polygon(50% 0%,0% 100%,100% 100%);}
-.icon-left{position:absolute;left:0px;bottom:0;text-align:center;width:80px;}
-.icon-right{position:absolute;right:0px;bottom:0;text-align:center;width:80px;}
-.lbl{font-size:12px;font-weight:bold;margin-top:2px;}
+body{font-family:'Zen Maru Gothic','Hiragino Maru Gothic ProN','Meiryo',sans-serif;margin:0;padding:10px;background:linear-gradient(135deg,#fff0f3,#fff4d6);border-radius:24px;color:#5a3e36;}
+@keyframes shake{0%{transform:rotate(var(--a))}25%{transform:rotate(calc(var(--a) + 4deg))}75%{transform:rotate(calc(var(--a) - 4deg))}100%{transform:rotate(var(--a))}}
+.shaking{animation:shake 0.7s ease-in-out infinite;}
+.mood{display:block;width:fit-content;margin:0 auto 6px;background:#fff;border:2px solid #ffc2cf;border-radius:999px;padding:4px 16px;font-size:13px;font-weight:700;color:#e0566f;}
+.wrap{position:relative;height:150px;display:flex;align-items:center;justify-content:center;}
+.seesaw{width:340px;height:16px;background:linear-gradient(90deg,#ffb3c1,#ffd59e,#ffb3c1);border-radius:999px;position:relative;box-shadow:0 3px 8px rgba(255,150,170,.4);transition:transform 1.2s cubic-bezier(0.34,1.56,0.64,1);}
+.seesaw::after{content:"";position:absolute;bottom:-26px;left:50%;width:26px;height:26px;background:#ff8fa3;transform:translateX(-50%);clip-path:polygon(50% 0%,0% 100%,100% 100%);}
+.icon-left{position:absolute;left:0;bottom:6px;text-align:center;width:90px;}
+.icon-right{position:absolute;right:0;bottom:6px;text-align:center;width:90px;}
+.face{font-size:38px;}
+.lbl{font-size:12px;font-weight:700;margin-top:2px;}
 .food-list{font-size:10px;margin-top:4px;line-height:1.6;}
-.info-row{display:flex;justify-content:space-around;margin-top:12px;font-size:12px;background:rgba(255,255,255,0.6);border-radius:8px;padding:8px 4px;}
-.info-item{text-align:center;}
-.val{font-weight:bold;font-size:16px;}
-.green{color:#16a34a;}.red{color:#dc2626;}.gray{color:#475569;}
+.info-row{display:flex;justify-content:space-around;margin-top:10px;font-size:11px;gap:6px;}
+.info-item{text-align:center;background:#fff;border-radius:16px;padding:8px 6px;flex:1;box-shadow:0 2px 8px rgba(255,150,170,.2);}
+.val{font-weight:700;font-size:17px;}
+.green{color:#35a37b;}.red{color:#e0405a;}.gray{color:#8a6d5b;}
 </style></head><body>
+<div class="mood" id="mood"></div>
 <div class="wrap">
-  <div class="icon-left"><div style="font-size:30px">💰</div><div class="lbl green">食べた！</div><div class="food-list green" id="safe-list"></div></div>
+  <div class="icon-left"><div class="face">😋</div><div class="lbl green">食べた！</div><div class="food-list green" id="safe-list"></div></div>
   <div id="ss" class="seesaw"></div>
-  <div class="icon-right"><div style="font-size:30px">🗑️</div><div class="lbl red">廃棄</div><div class="food-list red" id="near-list"></div></div>
+  <div class="icon-right"><div class="face">🥺</div><div class="lbl red">もったいない</div><div class="food-list red" id="near-list"></div></div>
 </div>
 <div class="info-row">
-  <div class="info-item"><div class="val red" id="risk">0</div><div>リスク額（円）</div></div>
-  <div class="info-item"><div class="val red" id="disc">0</div><div>廃棄済み（円）</div></div>
-  <div class="info-item"><div class="val gray" id="near">0件</div><div>期限接近中</div></div>
+  <div class="info-item"><div class="val red" id="risk">0</div><div>あぶない金額（円）</div></div>
+  <div class="info-item"><div class="val red" id="disc">0</div><div>捨てた金額（円）</div></div>
+  <div class="info-item"><div class="val gray" id="near">0件</div><div>もうすぐ期限</div></div>
 </div>
 <script>
 const d=""" + balance_data + """;
 const ss=document.getElementById('ss');
 ss.style.setProperty('--a',d.angle+'deg');
 setTimeout(()=>{ss.style.transform='rotate('+d.angle+'deg)';if(d.shake){ss.classList.add('shaking');}},300);
+document.getElementById('mood').innerText=d.mood;
 document.getElementById('risk').innerText=d.risk.toLocaleString();
 document.getElementById('disc').innerText=d.discarded.toLocaleString();
 document.getElementById('near').innerText=d.near_count+'件';
 document.getElementById('near-list').innerHTML=d.near_names.map(n=>'⚠️'+n).join('<br>');
 document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join('<br>');
 </script></body></html>"""
-        components.html(html_balance, height=260)
+        components.html(html_balance, height=300)
 
     st.write("---")
 
@@ -910,9 +1126,9 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
                 else:
                     col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2, 4])
                     with col1:
-                        st.write(f"**{item['name']}**")
+                        st.write(f"**{TYPE_EMOJI.get(item['food_type'], '🍽️')} {item['name']}**")
                         st.markdown(
-                            f"あと <span class='{cls}'>{days_label(days_left)}</span>",
+                            f"<span class='badge {cls}'>あと {days_label(days_left)}</span>",
                             unsafe_allow_html=True,
                         )
                     with col2:
@@ -1020,7 +1236,7 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
                 df_trend,
                 x="month",
                 y=[STATUS_CONSUMED, STATUS_DISCARDED],
-                color_discrete_map={STATUS_CONSUMED: "#2e8b57", STATUS_DISCARDED: "#b22222"},
+                color_discrete_map={STATUS_CONSUMED: "#5cc9a0", STATUS_DISCARDED: "#ff7a90"},
                 markers=True,
             )
             fig_line.update_layout(
