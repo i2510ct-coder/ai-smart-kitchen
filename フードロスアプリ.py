@@ -379,6 +379,7 @@ def analyze_image_with_gemini(image_bytes: bytes, mime_type: str = "image/jpeg")
     if mime_type not in valid_mime_types:
         mime_type = "image/jpeg"
 
+    image_bytes, mime_type = shrink_image(image_bytes, mime_type)
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
     try:
         res = client.models.generate_content(
@@ -532,6 +533,35 @@ def get_product_name_from_barcode(barcode: str):
     return None
 
 
+# ===== 写真入力（スマホは背面カメラで撮れるファイル選択、PCは通常のカメラ） =====
+def photo_input(label, key):
+    """スマホ：ファイル選択（「写真を撮る」で端末のカメラアプリが開く＝通常は背面カメラ）
+    PC：st.camera_input（ウェブカメラ）。サイドバーで切り替える。"""
+    if st.session_state.get("cam_mode_radio", "").startswith("💻"):
+        return st.camera_input(label, key=key)
+    st.caption("📱 スマホ：「写真を撮る」を選ぶと、カメラアプリ（通常は背面）が開きます")
+    return st.file_uploader(label, type=["jpg", "jpeg", "png"], key=key)
+
+
+def shrink_image(image_bytes: bytes, mime_type: str, max_side: int = 1600):
+    """大きな写真を縮小してJPEGにする（送信・解析を速くする）。失敗したら元のまま返す。"""
+    try:
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)  # スマホ写真の向き（EXIF）も反映される
+        if img is None:
+            return image_bytes, mime_type
+        h, w = img.shape[:2]
+        scale = max_side / max(h, w)
+        if scale < 1:
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if ok:
+            return buf.tobytes(), "image/jpeg"
+    except Exception:
+        pass
+    return image_bytes, mime_type
+
+
 # ===== デモデータ =====
 def seed_demo_data():
     """在庫（期限が近い/切れ/余裕あり）と、過去の消費・廃棄の履歴を投入する。"""
@@ -662,6 +692,14 @@ def main():
             st.warning("💾 保存先：ローカルSQLite（クラウドでは再起動で消えます）")
             if SUPABASE_URL and SUPABASE_KEY and not SUPABASE_AVAILABLE:
                 st.error("supabase ライブラリが未インストールです。requirements.txt を確認してください。")
+
+        st.subheader("📷 カメラの使い方")
+        st.radio(
+            "カメラの使い方",
+            ["📱 スマホ（背面カメラ）", "💻 PCのカメラ"],
+            key="cam_mode_radio",
+            label_visibility="collapsed",
+        )
 
         st.subheader("🛠 デモ用ツール")
         if st.button("デモデータを投入", use_container_width=True):
@@ -876,7 +914,7 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
                 st.session_state["show_barcode_cam"] = not st.session_state.get("show_barcode_cam", False)
 
         if st.session_state.get("show_barcode_cam"):
-            img = st.camera_input(
+            img = photo_input(
                 "バーコードを撮影（できるだけ大きく・明るく・ピントを合わせて）",
                 key=f"camera_{st.session_state['cam_key']}",
             )
@@ -959,7 +997,7 @@ document.getElementById('safe-list').innerHTML=d.safe_names.map(n=>'✅'+n).join
                 st.session_state["show_expiry_cam"] = not st.session_state.get("show_expiry_cam", False)
 
         if st.session_state.get("show_expiry_cam"):
-            expiry_img = st.camera_input(
+            expiry_img = photo_input(
                 "賞味期限部分を撮影（数字がはっきり写るように近づけてください）",
                 key=f"expiry_camera_{st.session_state['expiry_cam_key']}",
             )
